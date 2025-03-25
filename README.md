@@ -49,5 +49,5 @@ This tool was developed with Python using:
 ## Author
 
 Ye Yang (叶杨)  
-yang.ye@zju.edu.cn
+yang.ye@zju.edu.cn  
 School of Medicine, Zhejiang University (浙江大学医学院)
