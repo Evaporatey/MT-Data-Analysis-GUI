@@ -1,10 +1,6 @@
 # author: Ye Yang
 # For force-extension analysis of MT data
-# Inculde WLC and eWLC models for fitting
-# Jump detection and event analysis
-# Save data and figures
-# 注意：多段拟合存在bug尚未修复，每选择一个区间拟合后，使用中键随意选择两个点来重置，否则会卡住，问题未知。
-
+# 注意: 多段拟合存在bug，每次拟合完成手动选择两个点进行重置
 
 import math
 import os
@@ -14,9 +10,11 @@ import openpyxl
 import pandas as pd
 import numpy as np
 import scipy
+from scipy.signal import savgol_filter
+from scipy.ndimage import gaussian_filter1d
 from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QPushButton, QSizePolicy, QVBoxLayout, QWidget, QLabel,
                                QCheckBox, QSpinBox, QRadioButton, QButtonGroup, QMessageBox, QFormLayout, QLineEdit, QGroupBox, QTabWidget,
-                               QGridLayout)
+                               QGridLayout, QDoubleSpinBox)
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT, FigureCanvasQTAgg
 from PySide6.QtCore import Qt
 
@@ -86,6 +84,44 @@ def eWLC_fit(F, Lo, Lp, Ko):
     T = 300  # 默认温度300K
     return eWLC_inv(F, Lo, Lp, T, Ko)
 
+# Kalman Filter implementation (simple linear Kalman filter)
+def kalman_filter(data, R=0.1, Q=1e-5):
+    """
+    Apply a simple 1D Kalman filter.
+    Assumes constant velocity model.
+    Args:
+        data: Input data array.
+        R: Measurement noise covariance.
+        Q: Process noise covariance.
+    Returns:
+        Filtered data array.
+    """
+    n_iter = len(data)
+    sz = (n_iter,) # size of array
+
+    # allocate space for arrays
+    xhat=np.zeros(sz)      # a posteri estimate of x
+    P=np.zeros(sz)         # a posteri error estimate
+    xhatminus=np.zeros(sz) # a priori estimate of x
+    Pminus=np.zeros(sz)    # a priori error estimate
+    K=np.zeros(sz)         # gain or blending factor
+
+    # intial guesses
+    xhat[0] = data[0]
+    P[0] = 1.0
+
+    for k in range(1,n_iter):
+        # time update
+        xhatminus[k] = xhat[k-1]  # Simple prediction: next state is same as current
+        Pminus[k] = P[k-1]+Q
+
+        # measurement update
+        K[k] = Pminus[k]/( Pminus[k]+R )
+        xhat[k] = xhatminus[k]+K[k]*(data[k]-xhatminus[k])
+        P[k] = (1-K[k])*Pminus[k]
+
+    return xhat
+
 
 class FigureView(QWidget):
     def __init__(self, data_for_figure):
@@ -108,8 +144,17 @@ class FigureView(QWidget):
         self.fit_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
                            '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
         
+        # 初始化jumps_data属性
+        self.jumps_data = {'time': [], 'force': [], 'extension': [], 'jump_size': []}
+        
         # 绘制图表
         self.plotfig()
+
+        # 确保主窗口或画布可以接收键盘焦点
+        self.setFocusPolicy(Qt.StrongFocus)  # 让 FigureView 自身接收焦点
+
+        # 标记初始化完成
+        self._initialization_complete = True
 
     def _init_ui(self):
         """初始化用户界面"""
@@ -130,11 +175,11 @@ class FigureView(QWidget):
         self.figure_layout = QVBoxLayout(self.figure_panel)
         self.figure_layout.setContentsMargins(0, 0, 0, 0)
         
-        # 初始化控制UI组件 - 移到这里，确保在初始化图表前创建控件
-        self._init_control_ui()
-        
-        # 初始化图表 - 移到控件初始化之后
+        # 修改初始化顺序：先初始化图表，后初始化控件
         self._init_figure()
+        
+        # 再初始化控制UI组件
+        self._init_control_ui()
         
         # 添加面板到主布局 - 调整顺序，图形在左，控制在右
         self.main_layout.addWidget(self.figure_panel, 1)  # 图形面板占据更多空间
@@ -231,32 +276,81 @@ class FigureView(QWidget):
         # 添加滤波器设置
         filter_group = QGroupBox("Filter Settings")
         filter_layout = QVBoxLayout(filter_group)
-        
+
         # 滤波器类型
         self.filter_button_group = QButtonGroup(filter_group)
         self.median_filter_radio = QRadioButton('Median Filter')
         self.moving_avg_radio = QRadioButton('Moving Average')
+        self.savgol_filter_radio = QRadioButton('Savitzky-Golay') # New
+        self.gaussian_filter_radio = QRadioButton('Gaussian Filter') # New
+        self.kalman_filter_radio = QRadioButton('Kalman Filter') # New
         self.median_filter_radio.setChecked(True)
-        
+
         self.filter_button_group.addButton(self.median_filter_radio)
         self.filter_button_group.addButton(self.moving_avg_radio)
-        
+        self.filter_button_group.addButton(self.savgol_filter_radio) # New
+        self.filter_button_group.addButton(self.gaussian_filter_radio) # New
+        self.filter_button_group.addButton(self.kalman_filter_radio) # New
+
         filter_layout.addWidget(self.median_filter_radio)
         filter_layout.addWidget(self.moving_avg_radio)
-        
-        # 核大小
-        kernel_layout = QHBoxLayout()
+        filter_layout.addWidget(self.savgol_filter_radio) # New
+        filter_layout.addWidget(self.gaussian_filter_radio) # New
+        filter_layout.addWidget(self.kalman_filter_radio) # New
+
+        # --- Parameters for Median/Moving Average ---
+        self.kernel_params_widget = QWidget()
+        kernel_layout = QHBoxLayout(self.kernel_params_widget)
+        kernel_layout.setContentsMargins(0, 0, 0, 0)
         kernel_label = QLabel("Kernel Size:")
         self.kernel_size_box = QSpinBox()
-        self.kernel_size_box.setRange(1, 100)
+        self.kernel_size_box.setRange(1, 101) # Allow 101
         self.kernel_size_box.setValue(3)
-        self.kernel_size_box.setSingleStep(2)
+        self.kernel_size_box.setSingleStep(2) # Keep step 2 for median
         kernel_layout.addWidget(kernel_label)
         kernel_layout.addWidget(self.kernel_size_box)
-        filter_layout.addLayout(kernel_layout)
-        
+        filter_layout.addWidget(self.kernel_params_widget)
+
+        # --- Parameters for Savitzky-Golay ---
+        self.savgol_params_widget = QWidget()
+        savgol_layout = QFormLayout(self.savgol_params_widget)
+        savgol_layout.setContentsMargins(0, 0, 0, 0)
+        self.sg_window_box = QSpinBox()
+        self.sg_window_box.setRange(5, 101) # Window must be odd and >= polyorder+1
+        self.sg_window_box.setValue(5)
+        self.sg_window_box.setSingleStep(2) # Window must be odd
+        self.sg_polyorder_box = QSpinBox()
+        self.sg_polyorder_box.setRange(1, 10) # Polyorder < window
+        self.sg_polyorder_box.setValue(2)
+        savgol_layout.addRow("Window Size:", self.sg_window_box)
+        savgol_layout.addRow("Polyorder:", self.sg_polyorder_box)
+        filter_layout.addWidget(self.savgol_params_widget)
+
+        # --- Parameters for Gaussian ---
+        self.gaussian_params_widget = QWidget()
+        gaussian_layout = QHBoxLayout(self.gaussian_params_widget)
+        gaussian_layout.setContentsMargins(0, 0, 0, 0)
+        gaussian_label = QLabel("Sigma:")
+        self.gaussian_sigma_box = QDoubleSpinBox()
+        self.gaussian_sigma_box.setRange(0.1, 20.0)
+        self.gaussian_sigma_box.setValue(1.0)
+        self.gaussian_sigma_box.setSingleStep(0.1)
+        gaussian_layout.addWidget(gaussian_label)
+        gaussian_layout.addWidget(self.gaussian_sigma_box)
+        filter_layout.addWidget(self.gaussian_params_widget)
+
+        # --- Parameters for Kalman ---
+        self.kalman_params_widget = QWidget()
+        kalman_layout = QFormLayout(self.kalman_params_widget)
+        kalman_layout.setContentsMargins(0, 0, 0, 0)
+        self.kalman_q_input = QLineEdit("1e-5")
+        self.kalman_r_input = QLineEdit("0.1")
+        kalman_layout.addRow("Process Noise (Q):", self.kalman_q_input)
+        kalman_layout.addRow("Measure Noise (R):", self.kalman_r_input)
+        filter_layout.addWidget(self.kalman_params_widget)
+
         basic_layout.addWidget(filter_group)
-        
+
         # 保存按钮
         save_group = QGroupBox("Save Options")
         save_layout = QVBoxLayout(save_group)
@@ -314,73 +408,56 @@ class FigureView(QWidget):
         self.y_axis_box.currentTextChanged.connect(self.plotfig)
         self.x_axis_box.currentTextChanged.connect(self.plotfig)
         self.chose_sliced_data_box.currentTextChanged.connect(self.plotfig)
-        self.median_filter_radio.toggled.connect(self.plotfig)
-        self.moving_avg_radio.toggled.connect(self.plotfig)
+        self.median_filter_radio.toggled.connect(self._update_filter_params_visibility)
+        self.moving_avg_radio.toggled.connect(self._update_filter_params_visibility)
+        self.savgol_filter_radio.toggled.connect(self._update_filter_params_visibility)
+        self.gaussian_filter_radio.toggled.connect(self._update_filter_params_visibility)
+        self.kalman_filter_radio.toggled.connect(self._update_filter_params_visibility)
         self.kernel_size_box.valueChanged.connect(self.plotfig)
+        self.sg_window_box.valueChanged.connect(self.plotfig)
+        self.sg_polyorder_box.valueChanged.connect(self.plotfig)
+        self.gaussian_sigma_box.valueChanged.connect(self.plotfig)
+        self.kalman_q_input.textChanged.connect(self.plotfig)
+        self.kalman_r_input.textChanged.connect(self.plotfig)
 
-    def _create_basic_controls(self):
-        """创建基本控制控件"""
-        # Create horizontal layout for controls
-        controlsWidget = QWidget()
-        controlsLayout = QHBoxLayout(controlsWidget)
-        controlsLayout.setContentsMargins(5, 5, 5, 5)
-        controlsLayout.setSpacing(10)
+        # Initial visibility update
+        self._update_filter_params_visibility()
 
-        # Add radio buttons group
-        self._add_radio_buttons(controlsLayout)
-        
-        # Add combo boxes and other controls
-        self._add_combo_boxes(controlsLayout)
-        self._add_checkboxes_and_spinbox(controlsLayout)
-        self._add_labels_and_buttons(controlsLayout)
-        
-        return controlsWidget, controlsLayout
+    def _update_filter_params_visibility(self):
+        """Show/hide filter parameter widgets based on selection."""
+        is_median = self.median_filter_radio.isChecked()
+        is_moving_avg = self.moving_avg_radio.isChecked()
+        is_savgol = self.savgol_filter_radio.isChecked()
+        is_gaussian = self.gaussian_filter_radio.isChecked()
+        is_kalman = self.kalman_filter_radio.isChecked()
 
-    def _create_filter_controls(self):
-        """创建滤波控件组"""
-        filterWidget = QWidget()
-        filterLayout = QVBoxLayout(filterWidget)
-        filterLayout.setContentsMargins(5, 5, 5, 5)
-        filterLayout.setSpacing(10)
-        
-        # 添加滤波器选择单选按钮组
-        self.filter_button_group = QButtonGroup(filterWidget)
-        
-        self.median_filter_radio = QRadioButton('Median Filter')
-        self.median_filter_radio.setObjectName('median_filter_radio')
-        self.median_filter_radio.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.median_filter_radio.setChecked(True)  # 默认选择中值滤波
-        
-        self.moving_avg_radio = QRadioButton('Moving Average')
-        self.moving_avg_radio.setObjectName('moving_avg_radio')
-        self.moving_avg_radio.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        
-        self.filter_button_group.addButton(self.median_filter_radio)
-        self.filter_button_group.addButton(self.moving_avg_radio)
-        
-        filterLayout.addWidget(self.median_filter_radio)
-        filterLayout.addWidget(self.moving_avg_radio)
-        
-        # 创建内核大小控件和布局
-        kernelWidget = QWidget()
-        kernelLayout = QHBoxLayout(kernelWidget)
-        kernelLayout.setContentsMargins(0, 0, 0, 0)
-        
-        kernelLabel = QLabel("Kernel Size:")
-        kernelLayout.addWidget(kernelLabel)
-        
-        self.kernel_size_box = QSpinBox()
-        self.kernel_size_box.setObjectName("kernel_size_box")
-        self.kernel_size_box.setRange(1, 100)
-        self.kernel_size_box.setValue(3)
-        self.kernel_size_box.setSingleStep(2)
-        self.kernel_size_box.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.kernel_size_box.valueChanged.connect(self.plotfig)
-        kernelLayout.addWidget(self.kernel_size_box)
-        
-        filterLayout.addWidget(kernelWidget)
-        
-        return filterWidget
+        self.kernel_params_widget.setVisible(is_median or is_moving_avg)
+        self.savgol_params_widget.setVisible(is_savgol)
+        self.gaussian_params_widget.setVisible(is_gaussian)
+        self.kalman_params_widget.setVisible(is_kalman)
+
+        # Adjust kernel step for moving average (can be even)
+        if is_moving_avg:
+            self.kernel_size_box.setSingleStep(1)
+        else: # Median needs odd kernel
+            self.kernel_size_box.setSingleStep(2)
+            if self.kernel_size_box.value() % 2 == 0:
+                self.kernel_size_box.setValue(self.kernel_size_box.value() + 1)
+
+        # Ensure SavGol window is valid
+        if is_savgol:
+            min_win = self.sg_polyorder_box.value() + 1
+            if min_win % 2 == 0: min_win += 1 # Must be odd
+            self.sg_window_box.setMinimum(min_win)
+            if self.sg_window_box.value() < min_win:
+                self.sg_window_box.setValue(min_win)
+            if self.sg_window_box.value() % 2 == 0: # Ensure odd
+                self.sg_window_box.setValue(self.sg_window_box.value() + 1)
+
+        # 初始化时不触发重绘，避免fig未创建的问题
+        # 只在对象完全初始化后才触发plotfig
+        if hasattr(self, '_initialization_complete') and self._initialization_complete:
+            self.plotfig()
 
     def _create_model_controls(self):
         """Create model controls widget"""
@@ -731,86 +808,10 @@ class FigureView(QWidget):
         # 添加到图形面板
         self.figure_layout.addWidget(self.canvas)
         self.figure_layout.addWidget(self.toolbar)
-        
-        # 处理鼠标滚轮事件
-        def wheelEvent(event):
-            target = None
-            step = 0
-            
-            if self.y_axis_box.underMouse():
-                target = self.y_axis_box
-            elif self.x_axis_box.underMouse():
-                target = self.x_axis_box
-            elif self.chose_sliced_data_box.underMouse():
-                target = self.chose_sliced_data_box
-            elif self.kernel_size_box.underMouse():
-                if event.angleDelta().y() > 0:
-                    self.kernel_size_box.setValue(self.kernel_size_box.value() - 2)
-                else:
-                    self.kernel_size_box.setValue(self.kernel_size_box.value() + 2)
-                return
-            else:
-                super(FigureView, self).wheelEvent(event)
-                return
-                
-            if target:
-                step = -1 if event.angleDelta().y() > 0 else 1
-                target.setCurrentIndex((target.currentIndex() + step) % target.count())
-                
-        self.y_axis_box.wheelEvent = wheelEvent
-        self.x_axis_box.wheelEvent = wheelEvent
-        self.chose_sliced_data_box.wheelEvent = wheelEvent
-        
-        # 处理缩放事件
-        def zoom_event(event):
-            axtemp = event.inaxes
-            if not axtemp:
-                return
-                
-            x_min, x_max = axtemp.get_xlim()
-            y_min, y_max = axtemp.get_ylim()
-            x_range = x_max - x_min
-            y_range = y_max - y_min
-            x_zoom = x_range / 10
-            y_zoom = y_range / 10
 
-            if event.button == 'up':
-                axtemp.set(xlim=(x_min + x_zoom, x_max - x_zoom),
-                           ylim=(y_min + y_zoom, y_max - y_zoom))
-            elif event.button == 'down':
-                axtemp.set(xlim=(x_min - x_zoom, x_max + x_zoom),
-                           ylim=(y_min - y_zoom, y_max + y_zoom))
-            self.canvas.draw_idle()
-
-        self.canvas.mpl_connect('scroll_event', zoom_event)
-        
-        # 处理右键拖动事件
-        self.lastx = 0
-        self.lasty = 0
-        self.press = False
-
-        def on_press(event):
-            if event.inaxes and event.button == 3:
-                self.lastx = event.xdata
-                self.lasty = event.ydata
-                self.press = True
-
-        def on_move(event):
-            axtemp = event.inaxes
-            if axtemp and self.press:
-                x = event.xdata - self.lastx
-                y = event.ydata - self.lasty
-                x_min, x_max = axtemp.get_xlim()
-                y_min, y_max = axtemp.get_ylim()
-                axtemp.set(xlim=(x_min - x, x_max - x), ylim=(y_min - y, y_max - y))
-                self.canvas.draw_idle()
-
-        def on_release(event):
-            self.press = False
-
-        self.canvas.mpl_connect('button_press_event', on_press)
-        self.canvas.mpl_connect('button_release_event', on_release)
-        self.canvas.mpl_connect('motion_notify_event', on_move)
+        # 设置画布的焦点策略，使其能够接收键盘事件
+        self.canvas.setFocusPolicy(Qt.ClickFocus)  # 点击时获取焦点
+        self.canvas.setFocus()  # 初始设置焦点
         
         # 处理中键点击事件（获取点）
         self.points_for_save = []
@@ -995,6 +996,64 @@ class FigureView(QWidget):
         # 如果plotfig()是在__init__中首次调用，不需要删除现有widget
         # 直接使用figure_layout来管理canvas和toolbar
 
+    def _on_key_press(self, event):
+        """处理键盘事件（主要用于ESC取消选择）"""
+        if event.key == 'escape' and hasattr(self, 'selecting_fit_range') and self.selecting_fit_range:
+            self.reset_fitting_selection()
+            QMessageBox.information(self, "Selection Cancelled", "Fitting range selection has been cancelled.")
+
+    def keyPressEvent(self, event):
+        """处理键盘按键事件，实现快捷键切换"""
+        key = event.key()
+        modifiers = event.modifiers()
+
+        # 避免在文本框输入时触发快捷键
+        if isinstance(self.focusWidget(), QLineEdit):
+            super().keyPressEvent(event)
+            return
+
+        # 上下方向键切换 Y-Axis
+        if key == Qt.Key_Up:
+            current_index = self.y_axis_box.currentIndex()
+            next_index = (current_index - 1 + self.y_axis_box.count()) % self.y_axis_box.count()
+            self.y_axis_box.setCurrentIndex(next_index)
+            event.accept()
+        elif key == Qt.Key_Down:
+            current_index = self.y_axis_box.currentIndex()
+            next_index = (current_index + 1) % self.y_axis_box.count()
+            self.y_axis_box.setCurrentIndex(next_index)
+            event.accept()
+
+        # 左右方向键切换 Segment (仅当分段模式启用时)
+        elif key == Qt.Key_Left:
+            if self.sliced_data_box.isChecked() and self.chose_sliced_data_box.isEnabled():
+                current_index = self.chose_sliced_data_box.currentIndex()
+                next_index = (current_index - 1 + self.chose_sliced_data_box.count()) % self.chose_sliced_data_box.count()
+                self.chose_sliced_data_box.setCurrentIndex(next_index)
+                event.accept()
+            else:
+                super().keyPressEvent(event)  # 如果条件不满足，传递给父类处理
+        elif key == Qt.Key_Right:
+            if self.sliced_data_box.isChecked() and self.chose_sliced_data_box.isEnabled():
+                current_index = self.chose_sliced_data_box.currentIndex()
+                next_index = (current_index + 1) % self.chose_sliced_data_box.count()
+                self.chose_sliced_data_box.setCurrentIndex(next_index)
+                event.accept()
+            else:
+                super().keyPressEvent(event)  # 如果条件不满足，传递给父类处理
+
+        # 处理 ESC 键取消拟合区间选择 (如果 _on_key_press 未连接或失效)
+        elif key == Qt.Key_Escape:
+            if hasattr(self, 'selecting_fit_range') and self.selecting_fit_range:
+                self.reset_fitting_selection()
+                QMessageBox.information(self, "Selection Cancelled", "Fitting range selection has been cancelled by ESC key.")
+                event.accept()
+            else:
+                super().keyPressEvent(event)
+
+        else:
+            # 对于其他按键，调用父类的处理方法
+            super().keyPressEvent(event)
 
     def plotfig(self):
         """绘制图形"""
@@ -1097,10 +1156,22 @@ class FigureView(QWidget):
             set_size = self.kernel_size_box.value()
             
             # 使用选定的滤波方法
-            y_fitted = self._apply_filter(axis_y, set_size)
+            y_fitted = self._apply_filter(axis_y, kernel_size=set_size, sg_window=self.sg_window_box.value(), sg_polyorder=self.sg_polyorder_box.value(), gaussian_sigma=self.gaussian_sigma_box.value(), kalman_q=float(self.kalman_q_input.text()), kalman_r=float(self.kalman_r_input.text()))
             
             # 根据滤波器类型设置标签
-            filter_type = "Median Filter" if self.median_filter_radio.isChecked() else "Moving Average"
+            if self.median_filter_radio.isChecked():
+                filter_type = "Median Filter"
+            elif self.moving_avg_radio.isChecked():
+                filter_type = "Moving Average"
+            elif self.savgol_filter_radio.isChecked():
+                filter_type = "Savitzky-Golay"
+            elif self.gaussian_filter_radio.isChecked():
+                filter_type = "Gaussian Filter"
+            elif self.kalman_filter_radio.isChecked():
+                filter_type = "Kalman Filter"
+            else:
+                filter_type = "Unknown Filter"
+            
             ax.plot(axis_x, y_fitted, color='red', label=f'Filtered Data ({filter_type})')
         else:
             self.kernel_size_box.setEnabled(False)
@@ -1191,7 +1262,7 @@ class FigureView(QWidget):
             # 3. 滤波数据
             elif self.check_fitted_data_box.isChecked():
                 set_size = self.kernel_size_box.value()
-                filtered_extension = self._apply_filter(segment_extension, set_size)
+                filtered_extension = self._apply_filter(segment_extension, kernel_size=set_size, sg_window=self.sg_window_box.value(), sg_polyorder=self.sg_polyorder_box.value(), gaussian_sigma=self.gaussian_sigma_box.value(), kalman_q=float(self.kalman_q_input.text()), kalman_r=float(self.kalman_r_input.text()))
                 return filtered_extension, segment_time, segment_force
             
             # 4. 原始数据
@@ -1320,9 +1391,20 @@ class FigureView(QWidget):
         if self.check_fitted_data_box.isChecked():
             set_size = self.kernel_size_box.value()
             # 使用选定的滤波方法对原始数据进行滤波
-            fitted_data = self._apply_filter(raw_extension, set_size)
+            fitted_data = self._apply_filter(raw_extension, kernel_size=set_size, sg_window=self.sg_window_box.value(), sg_polyorder=self.sg_polyorder_box.value(), gaussian_sigma=self.gaussian_sigma_box.value(), kalman_q=float(self.kalman_q_input.text()), kalman_r=float(self.kalman_r_input.text()))
             # 添加滤波器类型信息
-            filter_type = "Median" if self.median_filter_radio.isChecked() else "MovingAvg"
+            if self.median_filter_radio.isChecked():
+                filter_type = "Median"
+            elif self.moving_avg_radio.isChecked():
+                filter_type = "MovingAvg"
+            elif self.savgol_filter_radio.isChecked():
+                filter_type = "SavGol"
+            elif self.gaussian_filter_radio.isChecked():
+                filter_type = "Gaussian"
+            elif self.kalman_filter_radio.isChecked():
+                filter_type = "Kalman"
+            else:
+                filter_type = "Unknown"
             headers.append(f'{filter_type} Filtered Extension(nm)')
             data_columns.append(fitted_data)
         
@@ -1351,7 +1433,6 @@ class FigureView(QWidget):
         # 保存Excel
         excel_saved = self._save_to_excel(xlsx_file_path, sheet_name, headers, data_columns)
         
-        # 只有成功保存Excel后才保存图片
         if excel_saved:
             # 定义图片文件路径
             fig_file_path = os.path.join(self.Data_Saved_Path, f"{self.base_name}_{sheet_name}.png")
@@ -1400,12 +1481,17 @@ class FigureView(QWidget):
                 QMessageBox.critical(self, "图片保存失败", f"保存图片时出错: {str(e)}\n"
                                    f"数据已保存到: {xlsx_file_path}")
 
-    def _apply_filter(self, data, kernel_size):
+    def _apply_filter(self, data, kernel_size=3, sg_window=5, sg_polyorder=2, gaussian_sigma=1.0, kalman_q=1e-5, kalman_r=0.1):
         """根据选择的滤波器类型应用滤波算法
         
         Args:
             data: 输入数据
             kernel_size: 滤波器大小
+            sg_window: Savitzky-Golay窗口大小
+            sg_polyorder: Savitzky-Golay多项式阶数
+            gaussian_sigma: Gaussian滤波器的sigma值
+            kalman_q: Kalman滤波器的过程噪声
+            kalman_r: Kalman滤波器的测量噪声
             
         Returns:
             滤波后的数据
@@ -1415,7 +1501,7 @@ class FigureView(QWidget):
         if self.median_filter_radio.isChecked():
             # 应用中值滤波
             return scipy.signal.medfilt(data, kernel_size=kernel_size)
-        else:
+        elif self.moving_avg_radio.isChecked():
             # 应用滑动平均滤波
             # 确保kernel_size是奇数
             if (kernel_size % 2) == 0:
@@ -1427,6 +1513,18 @@ class FigureView(QWidget):
             # 应用卷积（等效于滑动平均）
             # 使用mode='same'确保输出长度与输入相同
             return np.convolve(data, kernel, mode='same')
+        elif self.savgol_filter_radio.isChecked():
+            # 应用Savitzky-Golay滤波
+            return savgol_filter(data, sg_window, sg_polyorder)
+        elif self.gaussian_filter_radio.isChecked():
+            # 应用Gaussian滤波
+            return gaussian_filter1d(data, sigma=gaussian_sigma)
+        elif self.kalman_filter_radio.isChecked():
+            # 应用Kalman滤波
+            return kalman_filter(data, R=kalman_r, Q=kalman_q)
+        else:
+            # 如果没有选择滤波器，返回原始数据
+            return data
 
     def detect_force_jumps(self):
         """检测力跳变事件"""
@@ -1443,7 +1541,7 @@ class FigureView(QWidget):
         extension_data, time_data, force_data = self._get_current_data()
         
         # 应用滤波减少噪声
-        filtered_data = self._apply_filter(extension_data, self.kernel_size_box.value())
+        filtered_data = self._apply_filter(extension_data, kernel_size=self.kernel_size_box.value(), sg_window=self.sg_window_box.value(), sg_polyorder=self.sg_polyorder_box.value(), gaussian_sigma=self.gaussian_sigma_box.value(), kalman_q=float(self.kalman_q_input.text()), kalman_r=float(self.kalman_r_input.text()))
         
         # 检测跳变（使用一阶导数和阈值）
         diff_data = np.diff(filtered_data)
@@ -1507,81 +1605,6 @@ class FigureView(QWidget):
             }
         else:
             QMessageBox.information(self, "Event Detection", "No jump events detected")
-
-    def _add_advanced_analysis_tab(self):
-        """添加高级分析标签页"""
-        # 创建高级分析面板
-        self.advanced_panel = QWidget()
-        advanced_layout = QVBoxLayout(self.advanced_panel)
-        
-        # 添加模型分析组
-        model_group = QGroupBox("Theoretical Model Analysis")
-        model_layout = QVBoxLayout(model_group)
-        
-        # 添加模型选择标签和下拉菜单
-        modelLabel = QLabel("Theoretical Model:")
-        model_layout.addWidget(modelLabel)
-        
-        model_combo = QComboBox()
-        model_combo.addItems(["None", "DNA", "RNA", "Protein", "Custom"])
-        model_combo.currentTextChanged.connect(self.update_model_parameters)
-        model_layout.addWidget(model_combo)
-        self.model_combo_advanced = model_combo  # 使用不同的名称避免冲突
-        
-        advanced_layout.addWidget(model_group)
-        
-        # 添加事件分析组
-        event_group = QGroupBox("Event Analysis")
-        event_layout = QVBoxLayout(event_group)
-        
-        # 力跳变阈值
-        threshold_widget = QWidget()
-        threshold_layout = QHBoxLayout(threshold_widget)
-        threshold_layout.setContentsMargins(0, 0, 0, 0)
-        
-        threshold_label = QLabel("Jump Threshold (nm):")
-        self.jump_threshold_input = QLineEdit("2.0")
-        self.detect_jumps_button = QPushButton("Detect Jumps")
-        self.detect_jumps_button.clicked.connect(self.detect_force_jumps)
-        
-        threshold_layout.addWidget(threshold_label)
-        threshold_layout.addWidget(self.jump_threshold_input)
-        threshold_layout.addWidget(self.detect_jumps_button)
-        
-        event_layout.addWidget(threshold_widget)
-        
-        # 移除几何校正相关代码
-        
-        advanced_layout.addWidget(event_group)
-        
-        # 添加数据导出按钮
-        export_button = QPushButton("Export Analysis Results")
-        export_button.clicked.connect(self.export_analysis_data)
-        advanced_layout.addWidget(export_button)
-        
-        # 添加到主控制区
-        self.controlsLayout.addWidget(self.advanced_panel)
-
-    def export_analysis_data(self):
-        """导出分析结果到Excel文件"""
-        # 获取当前数据
-        extension_data, time_data, force_data = self._get_current_data()
-        
-        # 确保有跳变事件数据
-        if not hasattr(self, 'jumps_data') or len(self.jumps_data['time']) == 0:
-            QMessageBox.warning(self, "No Data", "No jump events detected to export")
-            return
-        
-        # 创建DataFrame
-        df = pd.DataFrame(self.jumps_data)
-        
-        # 保存到Excel
-        xlsx_file_path = os.path.join(self.Data_Saved_Path, self.base_name + '_jumps.xlsx')
-        try:
-            df.to_excel(xlsx_file_path, index=False)
-            QMessageBox.information(self, "Export Successful", f"Jump events data exported to {xlsx_file_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Failed to export data: {str(e)}")
 
     def _calculate_averaged_data(self, mag_height, force_data, extension_data):
         """计算平均简化数据
@@ -1693,12 +1716,6 @@ class FigureView(QWidget):
             self.selecting_fit_range = False
             self.fit_range_points = []
             QMessageBox.information(self, "Selection Reset", "Fitting range selection has been reset.")
-
-    def _on_key_press(self, event):
-        """处理键盘事件"""
-        if event.key == 'escape' and hasattr(self, 'selecting_fit_range') and self.selecting_fit_range:
-            self.reset_fitting_selection()
-            QMessageBox.information(self, "Selection Cancelled", "Fitting range selection has been cancelled.")
 
     def apply_model_to_range(self, x_min, x_max):
         """对选定范围的数据应用模型并拟合"""
@@ -1917,3 +1934,27 @@ class FigureView(QWidget):
             
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export fit results: {str(e)}")
+    
+    def export_analysis_data(self):
+        """导出跳变事件和分析数据"""
+        if not hasattr(self, 'jumps_data'):
+            QMessageBox.warning(self, "No Data", "No jump events detected. Please run event detection first.")
+            return
+            
+        xlsx_file_path = os.path.join(self.Data_Saved_Path, self.base_name + '_events.xlsx')
+        sheet_name = "Jump_Events"
+        
+        # 准备数据
+        headers = ['Time(s)', 'Force(pN)', 'Extension(nm)', 'Jump Size(nm)']
+        data_columns = [
+            self.jumps_data['time'],
+            self.jumps_data['force'],
+            self.jumps_data['extension'],
+            self.jumps_data['jump_size']
+        ]
+        
+        # 使用已有的Excel保存函数
+        success = self._save_to_excel(xlsx_file_path, sheet_name, headers, data_columns)
+        
+        if success:
+            QMessageBox.information(self, "Export Successful", f"Analysis data exported to {xlsx_file_path}")
